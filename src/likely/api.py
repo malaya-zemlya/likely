@@ -49,9 +49,10 @@ class _Indexer(ast.NodeVisitor):
             return
         if isinstance(y, ast.Constant) and isinstance(y.value, str):
             gk = ("const", y.value.strip())
-        elif isinstance(y, ast.Constant):
-            gk = ("const", y.value)
         else:
+            # A non-string y (e.g. likely("q", 42)) isn't a valid call, since
+            # state must be str; fall back to expr-identity, which just makes
+            # such a call site match nothing else.
             gk = ("expr", self._scope, ast.dump(y))
 
         callee = ast.dump(n.func)
