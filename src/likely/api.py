@@ -1,17 +1,14 @@
 """Public API for the likely package."""
 
-import logging
 import ast
 import sys
 import linecache
 import functools
 import threading
 from itertools import islice
-from typing import Callable, Iterable
+from typing import Iterable
 
 from typesafe_sdk import Noul, TypeSafeClient
-
-logger = logging.getLogger(__name__)
 
 class _Indexer(ast.NodeVisitor):
     """Per-file index of calls shaped like f("literal", <expr>)."""
@@ -34,7 +31,6 @@ class _Indexer(ast.NodeVisitor):
                 not n.keywords):
             return
         x, y = n.args
-        print(ast.dump(x), ast.dump(y))
         if not (isinstance(x, ast.Constant) and isinstance(x.value, str)):
             return
         if isinstance(y, ast.Constant):
@@ -84,19 +80,6 @@ class Likely:
         if key not in self._cache:
             self._fetch(state, {question} | self._siblings(sys._getframe(1), state))
         return self._cache[key]
-
-    def _score(self, question: str, state: str) -> float:
-        if not question or not question.strip():
-            raise ValueError("question must be a non-empty string")
-        if not state or not state.strip():
-            raise ValueError("state must be a non-empty string")
-
-        logger.debug("Likely called question=%r state=%r", question, state)
-        response = self._client.system_one(
-            state=state,
-            questions={"question": Noul(instructions=question)},
-        )
-        return response.answers["question"].noul
 
     def prefetch(self, y: str, xs: Iterable[str]) -> None:
         """Manual escape hatch for dynamic x's the index can't see."""
