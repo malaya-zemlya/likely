@@ -171,11 +171,7 @@ class Likely:
             return sorted(q for q in questions if (q, state) not in self._cache)
 
     def _fetch_chunk(self, state: str, chunk: list[str], required: set[str]) -> dict[str, float]:
-        """Fetch one chunk, falling back to per-question retries if the batch call fails.
-
-        A failure that survives the individual retry only propagates for a
-        ``required`` question; a merely-speculative sibling is dropped.
-        """
+        """Fetch one chunk, falling back to per-question retries if the batch call fails."""
         try:
             return self._request(state, chunk)
         except Exception:
@@ -183,7 +179,15 @@ class Likely:
                 "batch fetch failed for %d question(s) on state=%s; retrying individually",
                 len(chunk), _preview(state), exc_info=True,
             )
+        return self._retry_individually(state, chunk, required)
 
+    def _retry_individually(self, state: str, chunk: list[str], required: set[str]) -> dict[str, float]:
+        """Fetch each question in ``chunk`` on its own.
+
+        A failure only propagates for a ``required`` question; a merely
+        speculative sibling that fails is logged and dropped instead, so it
+        can never take the caller's own question down with it.
+        """
         scores: dict[str, float] = {}
         for q in chunk:
             try:
