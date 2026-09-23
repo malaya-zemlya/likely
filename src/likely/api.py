@@ -158,34 +158,52 @@ class Likely:
         state = self._require_text(state, "state")
         normalized = {q.strip() for q in questions if q.strip()}
         required = normalized if required is None else {q.strip() for q in required if q.strip()}
-        with self._lock:
-            todo = sorted(q for q in normalized if (q, state) not in self._cache)
+
+        todo = self._pending(state, normalized)
         for i in range(0, len(todo), self._max_batch_size):
             chunk = todo[i:i + self._max_batch_size]
-            try:
-                scores = self._request(state, chunk)
-            except Exception:
-                logger.warning(
-                    "batch fetch failed for %d question(s) on state=%s; retrying individually",
-                    len(chunk), _preview(state), exc_info=True,
-                )
-                scores = {}
-                for q in chunk:
-                    try:
-                        scores.update(self._request(state, [q]))
-                    except Exception:
-                        if q in required:
-                            raise
-                        logger.debug(
-                            "dropping question %s: fetch failed and it was only a sibling",
-                            _preview(q),
-                        )
+            scores = self._fetch_chunk(state, chunk, required)
+            self._store(state, scores)
 
-            with self._lock:
-                for q, score in scores.items():
-                    self._cache[(q, state)] = score
-                while len(self._cache) > self._cache_size:
-                    self._cache.popitem(last=False)
+    def _pending(self, state: str, questions: set[str]) -> list[str]:
+        """The subset of ``questions`` not already cached for ``state``."""
+        with self._lock:
+            return sorted(q for q in questions if (q, state) not in self._cache)
+
+    def _fetch_chunk(self, state: str, chunk: list[str], required: set[str]) -> dict[str, float]:
+        """Fetch one chunk, falling back to per-question retries if the batch call fails.
+
+        A failure that survives the individual retry only propagates for a
+        ``required`` question; a merely-speculative sibling is dropped.
+        """
+        try:
+            return self._request(state, chunk)
+        except Exception:
+            logger.warning(
+                "batch fetch failed for %d question(s) on state=%s; retrying individually",
+                len(chunk), _preview(state), exc_info=True,
+            )
+
+        scores: dict[str, float] = {}
+        for q in chunk:
+            try:
+                scores.update(self._request(state, [q]))
+            except Exception:
+                if q in required:
+                    raise
+                logger.debug(
+                    "dropping question %s: fetch failed and it was only a sibling",
+                    _preview(q),
+                )
+        return scores
+
+    def _store(self, state: str, scores: dict[str, float]) -> None:
+        """Cache ``scores`` for ``state``, evicting the oldest entries past ``cache_size``."""
+        with self._lock:
+            for q, score in scores.items():
+                self._cache[(q, state)] = score
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
 
     def _request(self, state: str, questions: list[str]) -> dict[str, float]:
         logger.debug(
