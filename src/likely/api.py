@@ -6,11 +6,12 @@ import sys
 import linecache
 import functools
 import threading
+from collections import OrderedDict
 from itertools import islice
 from types import FrameType
 from typing import Iterable
 
-from typesafe_sdk import Noul, TypeSafeClient
+from typesafe_sdk import Noul, NoulAnswer, TypeSafeClient
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,20 @@ def _index(filename: str) -> _Indexer:
 class Likely:
     """Estimate how likely a question is true given some state, via TypeSafe."""
 
-    def __init__(self, scorer: TypeSafeClient, max_batch_size: int = 256) -> None:
+    def __init__(
+        self,
+        scorer: TypeSafeClient,
+        max_batch_size: int = 256,
+        cache_size: int = 10_000,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be >= 1")
+        if cache_size < 1:
+            raise ValueError("cache_size must be >= 1")
         self._scorer = scorer
         self._max_batch_size = max_batch_size
-        self._cache: dict[tuple[str, str], float] = {}
+        self._cache_size = cache_size
+        self._cache: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._lock = threading.Lock()
 
     def __call__(self, question: str, state: str) -> float:
@@ -95,47 +106,105 @@ class Likely:
 
         Raises:
             ValueError: If ``question`` or ``state`` is empty or all whitespace.
+            RuntimeError: If TypeSafe couldn't answer ``question`` itself --
+                e.g. it returned a missing/wrong-typed or out-of-range
+                answer, or the answer was evicted from the cache by a
+                concurrent fetch before it could be read back. A failure on
+                a merely speculative sibling question never raises here.
         """
         question = self._require_text(question, "question")
         state = self._require_text(state, "state")
 
         key = (question, state)
-        cached = key in self._cache
+        with self._lock:
+            result = self._cache.get(key)
+        cached = result is not None
         if not cached:
-            self._fetch(state, {question} | self._siblings(sys._getframe(1), state))
-        result = self._cache[key]
+            siblings = self._siblings(sys._getframe(1), state)
+            self._fetch(state, {question} | siblings, required={question})
+            with self._lock:
+                result = self._cache.get(key)
+        if result is None:
+            raise RuntimeError(f"no answer returned for question {_preview(question)}")
         logger.debug(
             "likely(question=%s, state=%s) -> %.4f (%s)",
             _preview(question), _preview(state), result, "cache hit" if cached else "fetched",
         )
         return result
 
-    def prefetch(self, y: str, xs: Iterable[str]) -> None:
-        """Manual escape hatch for dynamic x's the index can't see."""
-        self._fetch(y, set(xs))
+    def prefetch(self, questions: Iterable[str], state: str) -> None:
+        """Manual escape hatch for dynamic questions the AST indexer can't see.
+
+        Argument order matches ``__call__(question, state)``.
+        """
+        if isinstance(questions, str):
+            raise TypeError("questions must be an iterable of strings, not a single string")
+        self._fetch(state, set(questions))
 
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()
 
-    def _fetch(self, y: str, xs: set[str]) -> None:
-        y = self._require_text(y, "state")
-        normalized = {v.strip() for v in xs if v.strip()}
-        with self._lock:
-            todo = sorted(v for v in normalized if (v, y) not in self._cache)
-            for i in range(0, len(todo), self._max_batch_size):
-                chunk = todo[i:i + self._max_batch_size]
+    def _fetch(self, state: str, questions: set[str], required: set[str] | None = None) -> None:
+        """Fetch answers for ``questions`` against ``state``.
 
-                logger.debug(
-                    "fetching %d question(s) for state=%s: %s",
-                    len(chunk), _preview(y), [_preview(v) for v in chunk],
+        ``required`` (defaulting to all of ``questions``) marks which ones the
+        caller actually asked for, as opposed to speculative siblings pulled
+        in for batching. If a batch call fails, we retry its questions one at
+        a time: a failure on a required question still propagates, but a
+        failure on a merely-speculative one is logged and dropped, so a bad
+        sibling can never break the caller's own request.
+        """
+        state = self._require_text(state, "state")
+        normalized = {q.strip() for q in questions if q.strip()}
+        required = normalized if required is None else {q.strip() for q in required if q.strip()}
+        with self._lock:
+            todo = sorted(q for q in normalized if (q, state) not in self._cache)
+        for i in range(0, len(todo), self._max_batch_size):
+            chunk = todo[i:i + self._max_batch_size]
+            try:
+                scores = self._request(state, chunk)
+            except Exception:
+                logger.warning(
+                    "batch fetch failed for %d question(s) on state=%s; retrying individually",
+                    len(chunk), _preview(state), exc_info=True,
                 )
-                response = self._scorer.system_one(
-                    state=y,
-                    questions={v: Noul(instructions=v) for v in chunk},
-                )
-                scores = {v: response.answers[v].noul for v in chunk}
-                self._cache.update({(v, y): scores[v] for v in chunk})
+                scores = {}
+                for q in chunk:
+                    try:
+                        scores.update(self._request(state, [q]))
+                    except Exception:
+                        if q in required:
+                            raise
+                        logger.debug(
+                            "dropping question %s: fetch failed and it was only a sibling",
+                            _preview(q),
+                        )
+
+            with self._lock:
+                for q, score in scores.items():
+                    self._cache[(q, state)] = score
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+
+    def _request(self, state: str, questions: list[str]) -> dict[str, float]:
+        logger.debug(
+            "fetching %d question(s) for state=%s: %s",
+            len(questions), _preview(state), [_preview(q) for q in questions],
+        )
+        response = self._scorer.system_one(
+            state=state,
+            questions={q: Noul(instructions=q) for q in questions},
+        )
+        scores: dict[str, float] = {}
+        for q in questions:
+            answer = response.answers.get(q)
+            if not isinstance(answer, NoulAnswer):
+                raise RuntimeError(f"missing or non-noul answer for {_preview(q)}")
+            if not 0.0 <= answer.noul <= 1.0:
+                raise RuntimeError(f"noul out of range for {_preview(q)}: {answer.noul}")
+            scores[q] = answer.noul
+        return scores
 
     @staticmethod
     def _require_text(value: str, name: str) -> str:

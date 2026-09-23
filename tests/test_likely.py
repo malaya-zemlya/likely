@@ -1,11 +1,7 @@
 import pytest
+from typesafe_sdk import NoulAnswer
 
 from likely import Likely
-
-
-class FakeAnswer:
-    def __init__(self, noul):
-        self.noul = noul
 
 
 class FakeResponse:
@@ -19,10 +15,13 @@ class FakeScorer:
     def __init__(self, score=0.5):
         self.score = score
         self.calls = []
+        self.fail_on = set()
 
     def system_one(self, *, state, questions):
         self.calls.append((state, set(questions)))
-        return FakeResponse({q: FakeAnswer(self.score) for q in questions})
+        if self.fail_on & set(questions):
+            raise RuntimeError("simulated TypeSafe failure")
+        return FakeResponse({q: NoulAnswer(noul=self.score) for q in questions})
 
 
 @pytest.fixture
@@ -59,7 +58,7 @@ def test_batches_sibling_questions_in_one_call(likely, scorer):
 
 def test_prefetch_populates_cache(likely, scorer):
     state = "prefetched state"
-    likely.prefetch(state, ["X", "Y"])
+    likely.prefetch(["X", "Y"], state)
     assert len(scorer.calls) == 1
     assert likely("X", state) == scorer.score
     assert len(scorer.calls) == 1
@@ -108,3 +107,60 @@ def test_logs_truncate_long_state_content(likely, caplog):
     messages = " ".join(record.getMessage() for record in caplog.records)
     assert long_state not in messages
     assert "chars)" in messages
+
+
+def test_prefetch_rejects_bare_string(likely):
+    with pytest.raises(TypeError):
+        likely.prefetch("not a list of questions", "some state")
+
+
+@pytest.mark.parametrize("kwarg", ["max_batch_size", "cache_size"])
+def test_rejects_non_positive_constructor_args(scorer, kwarg):
+    with pytest.raises(ValueError):
+        Likely(scorer, **{kwarg: 0})
+
+
+def test_missing_answer_raises(scorer):
+    class MissingAnswerScorer:
+        def system_one(self, *, state, questions):
+            return FakeResponse({})
+
+    likely = Likely(MissingAnswerScorer())
+    with pytest.raises(RuntimeError):
+        likely("Q", "state")
+
+
+def test_out_of_range_noul_raises(scorer):
+    class OutOfRangeScorer:
+        def system_one(self, *, state, questions):
+            return FakeResponse({q: NoulAnswer(noul=1.5) for q in questions})
+
+    likely = Likely(OutOfRangeScorer())
+    with pytest.raises(RuntimeError):
+        likely("Q", "state")
+
+
+def test_cache_is_bounded(scorer):
+    bounded = Likely(scorer, cache_size=2)
+    bounded("Q1", "s1")
+    bounded("Q2", "s2")
+    bounded("Q3", "s3")
+    assert len(scorer.calls) == 3
+    bounded("Q1", "s1")  # evicted as the oldest entry -> real refetch
+    assert len(scorer.calls) == 4
+
+
+def test_bad_sibling_does_not_break_real_question(likely, scorer):
+    state = "shared state for sibling isolation"
+    scorer.fail_on = {"Bad sibling"}
+    if False:
+        likely("Bad sibling", state)  # never runs; only registers as an AST sibling
+    result = likely("Good question", state)
+    assert result == scorer.score
+    assert ("Bad sibling", state) not in likely._cache
+
+
+def test_required_question_failure_propagates(likely, scorer):
+    scorer.fail_on = {"Broken question"}
+    with pytest.raises(RuntimeError):
+        likely("Broken question", "state for the broken-question test")
