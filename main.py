@@ -11,11 +11,12 @@ def main() -> None:
     likely = Likely(client)
 
     state = "The building is on fire and people are trapped inside."
-    question = "Does this describe an urgent situation?"
-
-    score = likely(question, state)
-    print(f"P({question!r} | {state!r}) = {score:.2f}")
-
+    print("state=", state)
+    score = likely("Does this describe an urgent situation?", state)
+    print(f"P(q1|state) = {score:.2f}")
+    score = likely("Is anything on fire?", state)
+    print(f"P(q2|state) = {score:.2f}")
+    
 
 if __name__ == "__main__":
     main()
