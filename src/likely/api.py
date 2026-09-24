@@ -9,7 +9,8 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import islice
-from types import FrameType
+from types import FrameType, ModuleType
+from typing import Callable
 
 from typesafe_sdk import Noul, NoulAnswer, TypeSafeClient
 
@@ -59,11 +60,105 @@ class _Noul:
 _Question = _Noul
 
 
+# A string template from the source: literal text, or a placeholder given as
+# (dotted name, f-string conversion, static format spec).
+_Part = str | tuple[tuple[str, ...], int, str]
+_Template = tuple[_Part, ...]
+
+# Only values whose formatting can't run user code are rendered speculatively.
+_SAFE_TYPES = (str, int, float, bool)
+
+
+class _Unresolved(Exception):
+    """A placeholder can't be rendered safely from the caller's frame."""
+
+
+def _render(template: _Template, resolve: Callable[[tuple[str, ...]], object]) -> str:
+    out: list[str] = []
+    for part in template:
+        if isinstance(part, str):
+            out.append(part)
+            continue
+        path, conversion, spec = part
+        value = resolve(path)
+        if conversion == ord("r"):
+            value = repr(value)
+        elif conversion == ord("a"):
+            value = ascii(value)
+        elif conversion == ord("s"):
+            value = str(value)
+        out.append(format(value, spec))
+    return "".join(out)
+
+
+def _resolver(frame: FrameType) -> Callable[[tuple[str, ...]], object]:
+    """Look up dotted names the way code in ``frame`` would, without running user code.
+
+    A name the function binds locally is only ever read from its locals, so an
+    unbound local never falls through to a global of the same name. Attribute
+    steps are only taken through modules, read from their ``__dict__`` (so
+    neither properties nor a module ``__getattr__`` can run).
+    """
+    code = frame.f_code
+    local_names = {*code.co_varnames, *code.co_cellvars, *code.co_freevars}
+    frame_locals = frame.f_locals
+
+    def resolve(path: tuple[str, ...]) -> object:
+        name, *attrs = path
+        if name in frame_locals:
+            value = frame_locals[name]
+        elif name in local_names:
+            raise _Unresolved(name)
+        elif name in frame.f_globals:
+            value = frame.f_globals[name]
+        elif name in frame.f_builtins:
+            value = frame.f_builtins[name]
+        else:
+            raise _Unresolved(name)
+        for attr in attrs:
+            if not isinstance(value, ModuleType) or attr not in vars(value):
+                raise _Unresolved(".".join(path))
+            value = vars(value)[attr]
+        if type(value) not in _SAFE_TYPES:
+            raise _Unresolved(".".join(path))
+        return value
+
+    return resolve
+
+
+def _no_frame(path: tuple[str, ...]) -> object:
+    raise _Unresolved(".".join(path))
+
+
+@dataclass(frozen=True)
+class _Spec:
+    """A call site's question as written: literal text or an f-string template."""
+    scope: tuple
+    question: _Template
+    yes: _Template = ()
+    no: _Template = ()
+
+    def render(self, resolve: Callable[[tuple[str, ...]], object]) -> _Question | None:
+        """The question this call site would ask right now, or None if unknowable."""
+        try:
+            return _Noul(
+                _render(self.question, resolve),
+                _render(self.yes, resolve),
+                _render(self.no, resolve),
+            )
+        except (_Unresolved, ValueError):
+            return None
+
+
 class _Indexer(ast.NodeVisitor):
-    """Per-file index of calls shaped like f("literal", <expr>[, yes="literal"][, no="literal"])."""
+    """Per-file index of calls shaped like f(text, <expr>[, yes=text][, no=text]).
+
+    ``text`` is a string literal, or an f-string whose placeholders are plain
+    names or module attributes (``{name}``, ``{config.NAME!r:>10}``).
+    """
     def __init__(self) -> None:
-        self.groups: dict[tuple, set[_Question]] = {}   # (callee, group key) -> questions
-        self.by_pos: dict[tuple, tuple] = {}      # call span -> (callee, group key)
+        self.groups: dict[tuple, set[_Spec]] = {}   # (callee, group key) -> specs
+        self.by_pos: dict[tuple, tuple] = {}      # call span -> ((callee, group key), scope)
         self.by_line: dict[int, list] = {}        # fallback for Python < 3.11
         self._scope = ("<module>",)
 
@@ -78,12 +173,13 @@ class _Indexer(ast.NodeVisitor):
         if not (isinstance(n.func, (ast.Name, ast.Attribute)) and len(n.args) == 2):
             return
         x, y = n.args
-        if not (isinstance(x, ast.Constant) and isinstance(x.value, str) and x.value.strip()):
+        question = self._template(x)
+        if question is None:
             return
         criteria = self._criteria(n.keywords)
         if criteria is None:
             return
-        question = _Noul(x.value, **criteria)
+        spec = _Spec(self._scope, question, **criteria)
         if isinstance(y, ast.Constant) and isinstance(y.value, str):
             gk = ("const", y.value.strip())
         else:
@@ -95,22 +191,64 @@ class _Indexer(ast.NodeVisitor):
         callee = ast.dump(n.func)
         entry = (callee, gk)
 
-        self.groups.setdefault(entry, set()).add(question)
-        self.by_pos[(n.lineno, n.end_lineno, n.col_offset, n.end_col_offset)] = entry
-        self.by_line.setdefault(n.lineno, []).append(entry)
+        self.groups.setdefault(entry, set()).add(spec)
+        self.by_pos[(n.lineno, n.end_lineno, n.col_offset, n.end_col_offset)] = (entry, self._scope)
+        self.by_line.setdefault(n.lineno, []).append((entry, self._scope))
+
+    @classmethod
+    def _criteria(cls, keywords: list[ast.keyword]) -> dict[str, _Template] | None:
+        """Text ``yes=``/``no=`` keywords, or None if any keyword isn't one of those."""
+        criteria: dict[str, _Template] = {}
+        for kw in keywords:
+            if kw.arg not in ("yes", "no"):
+                return None
+            if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                continue
+            template = cls._template(kw.value)
+            if template is None:
+                return None
+            criteria[kw.arg] = template
+        return criteria
+
+    @classmethod
+    def _template(cls, node: ast.expr) -> _Template | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return (node.value,)
+        if not isinstance(node, ast.JoinedStr):
+            return None
+        parts: list[_Part] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant):
+                parts.append(value.value)
+                continue
+            if not isinstance(value, ast.FormattedValue):
+                return None
+            path = cls._dotted(value.value)
+            spec = cls._static_spec(value.format_spec)
+            if path is None or spec is None:
+                return None
+            parts.append((path, value.conversion, spec))
+        return tuple(parts)
+
+    @classmethod
+    def _dotted(cls, node: ast.expr) -> tuple[str, ...] | None:
+        if isinstance(node, ast.Name):
+            return (node.id,)
+        if isinstance(node, ast.Attribute):
+            base = cls._dotted(node.value)
+            return None if base is None else (*base, node.attr)
+        return None
 
     @staticmethod
-    def _criteria(keywords: list[ast.keyword]) -> dict[str, str] | None:
-        """Literal ``yes=``/``no=`` keywords, or None if any keyword isn't one of those."""
-        criteria: dict[str, str] = {}
-        for kw in keywords:
-            if kw.arg not in ("yes", "no") or not isinstance(kw.value, ast.Constant):
-                return None
-            if isinstance(kw.value.value, str):
-                criteria[kw.arg] = kw.value.value
-            elif kw.value.value is not None:
-                return None
-        return criteria
+    def _static_spec(node: ast.expr | None) -> str | None:
+        """A format spec with no placeholders of its own, e.g. the ``>10`` in ``{x:>10}``."""
+        if node is None:
+            return ""
+        if isinstance(node, ast.JoinedStr) and all(
+            isinstance(v, ast.Constant) for v in node.values
+        ):
+            return "".join(v.value for v in node.values)
+        return None
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _visit_scope
 
@@ -284,7 +422,13 @@ class Likely:
             hit = cands[0] if len(cands) == 1 else None
         if hit is None:
             return set()
-        callee, _ = hit
+        entry, scope = hit
+        callee, _ = entry
         empty = frozenset()
         # we merge on likely("...", state) where we join on calls where `state is the same expression or the same value as y
-        return idx.groups.get(hit, empty) | idx.groups.get((callee, ("const", y)), empty)
+        specs = idx.groups.get(entry, empty) | idx.groups.get((callee, ("const", y)), empty)
+        # f-string siblings are rendered from the caller's frame, so only those in
+        # the caller's own scope can be; a stale value just wastes a sibling slot.
+        resolve = _resolver(frame)
+        rendered = (spec.render(resolve if spec.scope == scope else _no_frame) for spec in specs)
+        return {q for q in rendered if q is not None}

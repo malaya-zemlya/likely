@@ -1,7 +1,14 @@
+import types
+
 import pytest
 from typesafe_sdk import NoulAnswer
 
 from likely import Likely
+
+APPLICATION_NAME = "Acme Billing"
+config = types.ModuleType("config")
+config.TEAM = "payments"
+settings = types.SimpleNamespace(TEAM="payments")
 
 
 class FakeResponse:
@@ -188,4 +195,107 @@ def test_non_literal_criteria_is_not_batched(likely, scorer):
     assert scorer.calls == [
         (state, {"Plain question"}),
         (state, {"Dynamic question"}),
+    ]
+
+
+def test_batches_fstring_sibling_using_global(likely, scorer):
+    state = "global fstring state"
+    likely("Plain question", state)
+    likely(f"Does this concern {APPLICATION_NAME}?", state)
+    assert scorer.calls == [(state, {"Plain question", "Does this concern Acme Billing?"})]
+
+
+def test_batches_fstring_sibling_using_bound_local(likely, scorer):
+    state = "local fstring state"
+    team = "billing"
+    likely("Plain question", state)
+    likely(f"Is this for the {team} team?", state)
+    assert scorer.calls == [(state, {"Plain question", "Is this for the billing team?"})]
+
+
+def test_batches_fstring_sibling_using_module_attribute(likely, scorer):
+    state = "module attribute fstring state"
+    likely("Plain question", state)
+    likely(f"Is this for {config.TEAM}?", state)
+    assert scorer.calls == [(state, {"Plain question", "Is this for payments?"})]
+
+
+def test_does_not_render_attribute_of_non_module(likely, scorer):
+    state = "non-module attribute fstring state"
+    likely("Plain question", state)
+    likely(f"Is this for {settings.TEAM}?", state)
+    assert scorer.calls == [
+        (state, {"Plain question"}),
+        (state, {"Is this for payments?"}),
+    ]
+
+
+def test_unbound_local_does_not_fall_back_to_global(likely, scorer):
+    state = "shadowed global fstring state"
+    likely("Plain question", state)
+    APPLICATION_NAME = "Local app"
+    likely(f"Does this concern {APPLICATION_NAME}?", state)
+    assert scorer.calls == [
+        (state, {"Plain question"}),
+        (state, {"Does this concern Local app?"}),
+    ]
+
+
+def test_does_not_format_unsafe_types_speculatively(likely, scorer):
+    formatted = []
+
+    class Tracked:
+        def __format__(self, spec):
+            formatted.append(spec)
+            return "tracked"
+
+    state = "unsafe type fstring state"
+    thing = Tracked()
+    likely("Plain question", state)
+    assert formatted == []
+    likely(f"Is {thing} involved?", state)
+    assert scorer.calls == [
+        (state, {"Plain question"}),
+        (state, {"Is tracked involved?"}),
+    ]
+
+
+def test_renders_conversion_and_format_spec(likely, scorer):
+    state = "format spec fstring state"
+    name = "Bob"
+    count = 7
+    likely("Plain question", state)
+    likely(f"Is {name!r} named in ticket {count:03d}?", state)
+    assert scorer.calls == [(state, {"Plain question", "Is 'Bob' named in ticket 007?"})]
+
+
+def test_renders_fstring_criteria(likely, scorer):
+    state = "criteria fstring state"
+    team = "billing"
+    likely("Plain question", state)
+    likely("Is it ours?", state, yes=f"it belongs to the {team} team")
+    assert len(scorer.calls) == 1
+    assert {n.criteria and n.criteria["true"] for n in scorer.sent} == {None, "it belongs to the billing team"}
+
+
+def test_batches_fstring_questions_per_loop_iteration(likely, scorer):
+    state = "loop fstring state"
+    for topic in ["fire", "flood"]:
+        likely(f"Is this about {topic}?", state)
+        likely(f"Is the {topic} spreading?", state)
+    assert scorer.calls == [
+        (state, {"Is this about fire?", "Is the fire spreading?"}),
+        (state, {"Is this about flood?", "Is the flood spreading?"}),
+    ]
+
+
+def test_stale_fstring_sibling_is_refetched(likely, scorer):
+    state = "stale fstring state"
+    topic = "fire"
+    likely("Plain question", state)
+    topic = "flood"
+    assert likely(f"Is this about {topic}?", state) == scorer.score
+    assert scorer.calls == [
+        (state, {"Plain question", "Is this about fire?"}),
+        (state, {"Is this about flood?"}),
     ]
