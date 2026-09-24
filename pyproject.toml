@@ -1,7 +1,7 @@
 [project]
 name = "likely"
 version = "0.1.0"
-description = "Add your description here"
+description = "Branch on plain-English yes/no questions, batched into TypeSafe System One calls"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
