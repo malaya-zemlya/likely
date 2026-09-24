@@ -14,14 +14,17 @@ class FakeScorer:
 
     def __init__(self, score=0.5):
         self.score = score
-        self.calls = []
+        self.calls = []          # (state, {question text}) per call
+        self.sent = []           # every Noul object sent, in order
         self.fail_on = set()
 
     def system_one(self, *, state, questions):
-        self.calls.append((state, set(questions)))
-        if self.fail_on & set(questions):
+        texts = {q.instructions for q in questions.values()}
+        self.calls.append((state, texts))
+        self.sent.extend(questions.values())
+        if self.fail_on & texts:
             raise RuntimeError("simulated TypeSafe failure")
-        return FakeResponse({q: NoulAnswer(noul=self.score) for q in questions})
+        return FakeResponse({qid: NoulAnswer(noul=self.score) for qid in questions})
 
 
 @pytest.fixture
@@ -157,10 +160,45 @@ def test_bad_sibling_does_not_break_real_question(likely, scorer):
         likely("Bad sibling", state)  # never runs; only registers as an AST sibling
     result = likely("Good question", state)
     assert result == scorer.score
-    assert ("Bad sibling", state) not in likely._cache
+    calls_before = len(scorer.calls)
+    with pytest.raises(RuntimeError):
+        likely("Bad sibling", state)  # nothing was cached for it, so it's fetched (and fails) again
+    assert len(scorer.calls) > calls_before
 
 
 def test_required_question_failure_propagates(likely, scorer):
     scorer.fail_on = {"Broken question"}
     with pytest.raises(RuntimeError):
         likely("Broken question", "state for the broken-question test")
+
+
+def test_sends_criteria(likely, scorer):
+    likely("Is it urgent?", "criteria state", yes="  someone could get hurt  ")
+    (noul,) = scorer.sent
+    assert noul.criteria == {"true": "someone could get hurt", "false": None}
+
+
+def test_omits_criteria_when_not_given(likely, scorer):
+    likely("Is it urgent?", "no-criteria state")
+    (noul,) = scorer.sent
+    assert noul.criteria is None
+
+
+def test_same_question_with_different_criteria_are_distinct(likely, scorer):
+    state = "distinct criteria state"
+    likely("Is it bad?", state, yes="it breaks the law")
+    likely("Is it bad?", state, no="it is merely rude")
+    assert len(scorer.calls) == 1
+    assert len(scorer.sent) == 2
+    assert {n.criteria["true"] for n in scorer.sent} == {"it breaks the law", None}
+
+
+def test_non_literal_criteria_is_not_batched(likely, scorer):
+    state = "dynamic criteria state"
+    desc = "computed at runtime"
+    likely("Plain question", state)
+    likely("Dynamic question", state, yes=desc)
+    assert scorer.calls == [
+        (state, {"Plain question"}),
+        (state, {"Dynamic question"}),
+    ]
