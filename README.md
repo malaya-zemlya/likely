@@ -144,3 +144,8 @@ echo 'TYPESAFE_API_KEY=...' > .env
 uv run pytest -v          # tests use a fake client, no API key needed
 uv run python main.py     # demo against the real API
 ```
+
+## License
+
+[MIT No Attribution](LICENSE): do whatever you like with it. Attribution isn't
+required, but a link back is appreciated.
