@@ -1,37 +1,44 @@
+import logging
+import sys
+
 from dotenv import load_dotenv
 from typesafe_sdk import TypeSafeClient
 
 from likely import Likely
 
+# App config: f-string questions built from it are still batched, because the
+# value is already known when the first question about a report is asked.
+SERVICE_AREA = "the downtown campus"
+
 
 def triage(likely: Likely, report: str) -> None:
     print(f"\nReport: {report!r}")
 
-    urgency = likely(
+    if likely(
         "Does this describe an urgent, life-threatening situation?", report,
         yes="someone could be hurt or killed if nobody responds within the hour",
         no="an inconvenience, complaint, or property issue with no danger to people",
-    )
-    print(f"  urgency = {urgency:.2f}")
-
-    if urgency > 0.9:
-        # Both questions below share `report` as state, so they're batched
-        # into a single TypeSafe call alongside `urgency` above.
-        fire = likely("Is fire involved?", report)
-        medical = likely("Does this require immediate medical attention?", report)
-        print(f"  fire = {fire:.2f}, medical = {medical:.2f}")
-        print("  -> DISPATCH EMERGENCY SERVICES")
+    ) > 0.9:
+        # The questions below share `report` as state, so they're batched
+        # into a single TypeSafe call alongside the urgency question above --
+        # including the f-string, rendered with SERVICE_AREA ahead of time.
+        if likely("Is fire involved?", report) > 0.5:
+            print("  -> DISPATCH FIRE DEPARTMENT")
+        if likely("Does this require immediate medical attention?", report) > 0.5:
+            print("  -> DISPATCH AMBULANCE")
+        if likely(f"Is this happening at {SERVICE_AREA}?", report) > 0.5:
+            print("  -> ALERT CAMPUS SECURITY")
+    elif likely("Should this be escalated for follow-up within 24 hours?", report) > 0.5:
+        print("  -> SCHEDULE FOLLOW-UP")
     else:
-        followup = likely("Should this be escalated for follow-up within 24 hours?", report)
-        print(f"  followup = {followup:.2f}")
-        if followup > 0.5:
-            print("  -> SCHEDULE FOLLOW-UP")
-        else:
-            print("  -> LOG AND CLOSE, no action needed")
+        print("  -> LOG AND CLOSE, no action needed")
 
 
 def main() -> None:
     load_dotenv()
+    # likely logs every request it sends and every probability it returns.
+    logging.basicConfig(stream=sys.stdout, format="  %(message)s")
+    logging.getLogger("likely").setLevel(logging.DEBUG)
 
     client = TypeSafeClient()
     likely = Likely(client)

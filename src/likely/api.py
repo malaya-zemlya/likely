@@ -392,7 +392,7 @@ class Likely:
     def _request(self, state: str, questions: list[_Question]) -> dict[_Question, float]:
         logger.debug(
             "fetching %d question(s) for state=%s: %s",
-            len(questions), _preview(state), [_preview(q.question) for q in questions],
+            len(questions), _preview(state), ", ".join(_preview(q.question) for q in questions),
         )
         # Question ids are opaque to the model; the text can't be the id, since
         # the same text with different criteria is a different question.
