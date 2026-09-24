@@ -7,7 +7,11 @@ from likely import Likely
 def triage(likely: Likely, report: str) -> None:
     print(f"\nReport: {report!r}")
 
-    urgency = likely("Does this describe an urgent, life-threatening situation?", report)
+    urgency = likely(
+        "Does this describe an urgent, life-threatening situation?", report,
+        yes="someone could be hurt or killed if nobody responds within the hour",
+        no="an inconvenience, complaint, or property issue with no danger to people",
+    )
     print(f"  urgency = {urgency:.2f}")
 
     if urgency > 0.9:
