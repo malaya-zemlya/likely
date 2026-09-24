@@ -10,7 +10,6 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import islice
 from types import FrameType
-from typing import Iterable
 
 from typesafe_sdk import Noul, NoulAnswer, TypeSafeClient
 
@@ -122,7 +121,7 @@ def _index(filename: str) -> _Indexer:
     try:
         idx.visit(ast.parse("".join(linecache.getlines(filename)), filename))
     except (SyntaxError, ValueError):
-        pass                                   # no source -> no prefetch, still correct
+        pass                                   # no source -> no batching, still correct
     return idx
 
 class Likely:
@@ -184,34 +183,20 @@ class Likely:
         )
         return result
 
-    def prefetch(self, questions: Iterable[str], state: str) -> None:
-        """Manual escape hatch for dynamic questions the AST indexer can't see.
-
-        Argument order matches ``__call__(question, state)``.
-        """
-        if isinstance(questions, str):
-            raise TypeError("questions must be an iterable of strings, not a single string")
-        self._fetch(state, {_Noul(q) for q in questions if q.strip()})
-
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()
 
-    def _fetch(
-        self, state: str, questions: set[_Question], required: set[_Question] | None = None,
-    ) -> None:
+    def _fetch(self, state: str, questions: set[_Question], required: set[_Question]) -> None:
         """Fetch answers for ``questions`` against ``state``.
 
-        ``required`` (defaulting to all of ``questions``) marks which ones the
-        caller actually asked for, as opposed to speculative siblings pulled
-        in for batching. If a batch call fails, we retry its questions one at
-        a time: a failure on a required question still propagates, but a
-        failure on a merely-speculative one is logged and dropped, so a bad
-        sibling can never break the caller's own request.
+        ``required`` marks which ones the caller actually asked for, as
+        opposed to speculative siblings pulled in for batching. If a batch
+        call fails, we retry its questions one at a time: a failure on a
+        required question still propagates, but a failure on a
+        merely-speculative one is logged and dropped, so a bad sibling can
+        never break the caller's own request.
         """
-        state = self._require_text(state, "state")
-        required = questions if required is None else required
-
         todo = self._pending(state, questions)
         for i in range(0, len(todo), self._max_batch_size):
             chunk = todo[i:i + self._max_batch_size]

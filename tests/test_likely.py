@@ -59,14 +59,6 @@ def test_batches_sibling_questions_in_one_call(likely, scorer):
     assert call_questions == {"Question A", "Question B"}
 
 
-def test_prefetch_populates_cache(likely, scorer):
-    state = "prefetched state"
-    likely.prefetch(["X", "Y"], state)
-    assert len(scorer.calls) == 1
-    assert likely("X", state) == scorer.score
-    assert len(scorer.calls) == 1
-
-
 def test_clear_forces_refetch(likely, scorer):
     state = "clearable"
     likely("Q", state)
@@ -110,11 +102,6 @@ def test_logs_truncate_long_state_content(likely, caplog):
     messages = " ".join(record.getMessage() for record in caplog.records)
     assert long_state not in messages
     assert "chars)" in messages
-
-
-def test_prefetch_rejects_bare_string(likely):
-    with pytest.raises(TypeError):
-        likely.prefetch("not a list of questions", "some state")
 
 
 @pytest.mark.parametrize("kwarg", ["max_batch_size", "cache_size"])
